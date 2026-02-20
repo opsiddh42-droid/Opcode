@@ -44,7 +44,6 @@ USER_SETTINGS = {}
 USER_STATE = {}
 PENDING_TRADE = {}
 ACTIVE_TOKENS = {} 
-# file_lock removed as MongoDB handles concurrent writes natively
 
 # =========================================
 # --- 1. SETUP & MONGODB MANAGEMENT ---
@@ -55,27 +54,41 @@ bot = telebot.TeleBot(BOT_TOKEN)
 
 def load_users():
     try:
-        # Fetching users directly from MongoDB instead of users.csv
+        USER_DETAILS.clear()
         for row in users_col.find():
-            cid = int(row['ChatID'])
+            cid = int(row.get('ChatID', 0))
+            if cid == 0: continue
+            
             USER_DETAILS[cid] = {
-                "Name": row['Name'], "Key": row['ConsumerKey'], 
-                "Mobile": row['Mobile'], "UCC": row['UCC'], "MPIN": row['MPIN']
+                "Name": row.get('Name', ''), 
+                "Key": row.get('Key', row.get('ConsumerKey', '')), 
+                "Mobile": row.get('Mobile', ''), 
+                "UCC": row.get('UCC', ''), 
+                "MPIN": row.get('MPIN', '')
             }
             if cid not in USER_SETTINGS: 
                 USER_SETTINGS[cid] = {"Index": "NIFTY", "ATM": None}
-    except Exception as e: print(f"Load Error: {e}")
+    except Exception as e: 
+        print(f"Load Error: {e}")
 load_users()
 
 def save_new_user(cid, data):
-    new_row = {"ChatID": str(cid), "Name": data["Name"], "ConsumerKey": data["Key"], "Mobile": data["Mobile"], "UCC": data["UCC"], "MPIN": data["MPIN"]}
+    new_row = {
+        "ChatID": str(cid), 
+        "Name": data.get("Name", ""), 
+        "Key": data.get("Key", data.get("ConsumerKey", "")), 
+        "Mobile": data.get("Mobile", ""), 
+        "UCC": data.get("UCC", ""), 
+        "MPIN": data.get("MPIN", "")
+    }
     try:
-        # Saving user to MongoDB
         users_col.insert_one(new_row)
         USER_DETAILS[cid] = new_row
         USER_SETTINGS[cid] = {"Index": "NIFTY", "ATM": None}
         return True
-    except: return False
+    except Exception as e: 
+        print(f"MongoDB Insert Error: {e}")
+        return False
 
 def log_trade(cid, idx_name, trade_symbol, token, opt_type, side, qty, price, order_id):
     new_row = {
@@ -86,7 +99,6 @@ def log_trade(cid, idx_name, trade_symbol, token, opt_type, side, qty, price, or
         "OrderID": str(order_id), "SLOrderID": "", "SLPrice": 0
     }
     try:
-        # Logging trade to MongoDB trades collection
         trades_col.insert_one(new_row)
     except Exception as e: print(f"Log Error: {e}")
 
@@ -291,7 +303,7 @@ def cmd_start(message):
         if cid in USER_SESSIONS:
             bot.send_message(cid, f"👋 Ready! Index: **{USER_SETTINGS[cid]['Index']}**", reply_markup=get_main_menu(cid))
         else:
-            bot.send_message(cid, f"👋 Welcome back **{USER_DETAILS[cid]['Name']}**!", reply_markup=get_login_btn())
+            bot.send_message(cid, f"👋 Welcome back **{USER_DETAILS[cid].get('Name', '')}**!", reply_markup=get_login_btn())
     else:
         USER_STATE[cid] = "REG_NAME"
         TEMP_REG_DATA[cid] = {}
@@ -319,8 +331,11 @@ def reg_flow(m):
         USER_STATE[cid] = "REG_MPIN"; bot.send_message(cid, "Enter MPIN:")
     elif st == "REG_MPIN":
         TEMP_REG_DATA[cid]['MPIN'] = text
+        bot.send_message(cid, "⏳ Saving to Database...")
         if save_new_user(cid, TEMP_REG_DATA[cid]):
             bot.send_message(cid, "✅ Registered! Click Login.", reply_markup=get_login_btn())
+        else:
+            bot.send_message(cid, "❌ Database Error! Render logs check karein.")
         USER_STATE[cid] = None
 
 @bot.message_handler(func=lambda m: m.text == "🔐 Login Now")
@@ -338,10 +353,19 @@ def main_handler(message):
 
     if state == "WAIT_TOTP":
         try:
-            u = USER_DETAILS[cid]
-            cl = NeoAPI(consumer_key=u['Key'], environment='prod')
-            cl.totp_login(mobile_number=u['Mobile'], ucc=u['UCC'], totp=text)
-            cl.totp_validate(mpin=u['MPIN'])
+            u = USER_DETAILS.get(cid, {})
+            # Smart Key Checker updated here
+            api_key = u.get('Key', u.get('ConsumerKey'))
+            
+            if not api_key:
+                bot.send_message(cid, "❌ API Key error. Type /start to register again.")
+                USER_STATE[cid] = None
+                return
+
+            cl = NeoAPI(consumer_key=api_key, environment='prod')
+            cl.totp_login(mobile_number=u.get('Mobile'), ucc=u.get('UCC'), totp=text)
+            cl.totp_validate(mpin=u.get('MPIN'))
+            
             USER_SESSIONS[cid] = cl
             check_master_files()
             USER_STATE[cid] = None
@@ -509,7 +533,6 @@ def main_handler(message):
             bot.send_message(cid, msg, reply_markup=get_main_menu(cid))
             USER_STATE[cid] = None
         except Exception as e: bot.send_message(cid, f"❌ OI Error: {e}")
-
 # =========================================
 # --- 7. CALLBACK HANDLER ---
 # =========================================
@@ -698,7 +721,6 @@ def on_callback(call):
             bot.send_message(cid, "🏁 **SAFE EXIT COMPLETE.**\nAll Sells closed before Buys.")
         except Exception as e: bot.send_message(cid, f"❌ Exit All Error: {e}")
 
-# =======
 # =========================================
 # --- 8. RENDER CRASH PROTECTION & DUMMY SERVER ---
 # =========================================
