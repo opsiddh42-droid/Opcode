@@ -698,14 +698,38 @@ def on_callback(call):
             bot.send_message(cid, "🏁 **SAFE EXIT COMPLETE.**\nAll Sells closed before Buys.")
         except Exception as e: bot.send_message(cid, f"❌ Exit All Error: {e}")
 
+# =======
 # =========================================
-# --- 8. RENDER CRASH PROTECTION LOOP ---
+# --- 8. RENDER CRASH PROTECTION & DUMMY SERVER ---
 # =========================================
+import os
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import threading
+
+# Dummy server class to keep Render Web Service happy
+class DummyHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b"Bot is active and polling!")
+
+def keep_alive():
+    # Render assigns a PORT environment variable dynamically
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(('0.0.0.0', port), DummyHandler)
+    print(f"🌐 Dummy web server running on port {port}")
+    server.serve_forever()
+
 def start_bot():
-    print("Bot is polling...")
+    print("🤖 Bot is polling...")
     bot.infinity_polling()
 
 if __name__ == "__main__":
+    # Start the dummy server in a background thread
+    threading.Thread(target=keep_alive, daemon=True).start()
+    
+    # Start the Telegram bot in the main thread
     while True:
         try:
             start_bot()
