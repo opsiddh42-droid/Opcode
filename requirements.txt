@@ -1,5 +1,5 @@
 pyTelegramBotAPI==4.14.0
 pandas
-requests==2.31.0
+requests
 git+https://github.com/Kotak-Neo/Kotak-neo-api-v2.git@v2.0.1#egg=neo_api_client
 pymongo==4.6.1
