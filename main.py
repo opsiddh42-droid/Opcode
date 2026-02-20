@@ -110,17 +110,26 @@ def format_crore_lakh(number):
 # =========================================
 # --- 2. DATA ENGINE & MONITOR ---
 # =========================================
-def check_master_files():
+# =========================================
+# --- 2. DATA ENGINE & MONITOR ---
+# =========================================
+def check_master_files(force=False):
     for idx_name, conf in INDICES_CONFIG.items():
-        # Check if master data already exists in MongoDB for this index
-        if fo_master_col.count_documents({"IndexName": idx_name}) == 0:
+        # Agar force=True hai ya data nahi hai, tabhi download karega
+        if force or fo_master_col.count_documents({"IndexName": idx_name}) == 0:
             try:
                 r = requests.get(conf["Url"])
-                # Read directly from memory, no local file saved
                 df = pd.read_csv(io.StringIO(r.text), sep=',', header=None, low_memory=False)
+                
+                # Check: Agar file mein 10 se kam columns hain, toh ye HTML/Error page hai (Skip kar do)
+                if len(df.columns) < 10:
+                    continue
+                    
                 df["IndexName"] = idx_name
-                # MongoDB requires string keys; Pandas default header=None uses integers
                 df.columns = df.columns.astype(str) 
+                
+                # Naya data daalne se pehle purana corrupt data hata do
+                fo_master_col.delete_many({"IndexName": idx_name})
                 
                 records = df.to_dict("records")
                 if records:
@@ -132,20 +141,32 @@ def auto_generate_chain(cid):
     conf = INDICES_CONFIG[idx_name]
     if cid not in USER_SESSIONS: return False, "No Session"
     client = USER_SESSIONS[cid]
+    
     check_master_files()
+    
     now = datetime.now()
     yy = now.strftime("%y")
     mon = now.strftime("%b").upper()
     search_sym = f"{idx_name}{yy}{mon}FUT"
+    
     try:
-        # Fetch Master Data from MongoDB instead of CSV
         cursor = fo_master_col.find({"IndexName": idx_name})
         df = pd.DataFrame(list(cursor))
-        if df.empty: return False, "Master Data Empty"
+        
+        # SMART FIX: Agar data corrupt hai ya column '5' nahi hai, toh forcefully re-download karo
+        if df.empty or "5" not in df.columns.astype(str):
+            check_master_files(force=True)
+            cursor = fo_master_col.find({"IndexName": idx_name})
+            df = pd.DataFrame(list(cursor))
+            if df.empty or "5" not in df.columns.astype(str):
+                return False, "Master Data Error (Kotak API Down)"
 
-        # Using string "5" instead of int 5 because MongoDB keys are strings
+        # Ensure all columns are treated as strings
+        df.columns = df.columns.astype(str)
+
         row = df[df["5"] == search_sym]
         if row.empty: return False, "Future Not Found"
+        
         fut_token = str(int(row.iloc[0]["0"]))
         
         q = client.quotes(instrument_tokens=[{"instrument_token": fut_token, "exchange_segment": conf["Exchange"]}], quote_type="all")
@@ -154,10 +175,12 @@ def auto_generate_chain(cid):
             item = q[0] if isinstance(q, list) else q.get('data', [{}])[0]
             ltp = float(item.get('ltp', item.get('lastPrice', 0)))
         if ltp == 0: return False, "Future Price 0"
+        
         atm = round(ltp / conf["StrikeGap"]) * conf["StrikeGap"]
         USER_SETTINGS[cid]["ATM"] = f"{atm}"
         expiry_date_str = None
         all_ref_keys = set(df["7"].astype(str).values) 
+        
         for i in range(0, 45):
             test_date = now + timedelta(days=i)
             d_str = f"{test_date.strftime('%d')}{test_date.strftime('%b').upper()}{test_date.strftime('%y')}"
@@ -165,11 +188,14 @@ def auto_generate_chain(cid):
             if check_sym in all_ref_keys:
                 expiry_date_str = d_str
                 break
+                
         if not expiry_date_str: return False, "Expiry Not Found"
+        
         prefix = f"{idx_name}{expiry_date_str}"
         relevant = df[df["7"].str.startswith(prefix, na=False)]
         strikes = [atm + (i * conf["StrikeGap"]) for i in range(-20, 21)]
         new_list = []
+        
         for index, r in relevant.iterrows():
             ref_key = str(r["7"]).strip()
             trd_sym = str(r["5"]).strip()
@@ -179,88 +205,11 @@ def auto_generate_chain(cid):
                      new_list.append({"TradeSymbol": trd_sym, "RefKey": ref_key, "Token": token, "Type": "CE", "Strike": stk, "LTP": 0.0, "OI": 0})
                 elif f"{stk}.00PE" in ref_key:
                      new_list.append({"TradeSymbol": trd_sym, "RefKey": ref_key, "Token": token, "Type": "PE", "Strike": stk, "LTP": 0.0, "OI": 0})
+                     
         ACTIVE_TOKENS[cid] = new_list
         return True, f"ATM: {atm} | Exp: {expiry_date_str}"
     except Exception as e: return False, f"Err: {str(e)}"
 
-def fetch_data_for_user(cid):
-    if cid not in USER_SESSIONS: return False
-    if cid not in ACTIVE_TOKENS or not ACTIVE_TOKENS[cid]: auto_generate_chain(cid)
-    client = USER_SESSIONS[cid]
-    idx_name = USER_SETTINGS[cid]["Index"]
-    conf = INDICES_CONFIG[idx_name]
-    try:
-        all_tokens = ACTIVE_TOKENS[cid]
-        live_map = {}
-        batch_size = 50
-        for i in range(0, len(all_tokens), batch_size):
-            batch = all_tokens[i : i + batch_size]
-            tokens = [{"instrument_token": x['Token'], "exchange_segment": conf["Exchange"]} for x in batch]
-            q = client.quotes(instrument_tokens=tokens, quote_type="all")
-            if q:
-                raw = q if isinstance(q, list) else q.get('data', [])
-                for item in raw:
-                    tk = str(item.get('exchange_token') or item.get('tk'))
-                    ltp_val = float(item.get('ltp', item.get('lastPrice', 0)))
-                    oi_val = int(item.get('open_int') or item.get('openInterest') or item.get('oi') or 0)
-                    live_map[tk] = {'ltp': ltp_val, 'oi': oi_val}
-        for item in all_tokens:
-            d = live_map.get(item['Token'], {'ltp': 0, 'oi': 0})
-            item['LTP'] = d['ltp']; item['OI'] = d['oi']
-        ACTIVE_TOKENS[cid] = all_tokens 
-        return True
-    except: return False
-
-def sl_monitor_thread():
-    while True:
-        try:
-            # Fetch ONLY open trades with an active SL from MongoDB directly
-            open_sl_trades = list(trades_col.find({"Status": "OPEN", "SLOrderID": {"$nin": ["", "nan", None]}}))
-            
-            for row in open_sl_trades:
-                sl_id = str(row.get('SLOrderID', ""))
-                cid = int(row['ChatID'])
-                if cid in USER_SESSIONS:
-                    client = USER_SESSIONS[cid]
-                    order_hist = client.order_history(order_id=sl_id)
-                    if order_hist and isinstance(order_hist, list):
-                        status = order_hist[0].get('status', '').upper()
-                        if status in ['COMPLETE', 'FILLED']:
-                            # Update Main leg to CLOSED in DB
-                            trades_col.update_one({"_id": row["_id"]}, {"$set": {"Status": "CLOSED", "ExitPrice": row['SLPrice']}})
-                            bot.send_message(cid, f"🎯 **SL HIT:** {row['TradeSymbol']}\nClosing Hedge Automatically...")
-                            
-                            # Find Hedge position in DB
-                            hedge_pos = list(trades_col.find({"ChatID": str(cid), "Status": "OPEN", "Side": "BUY", "Index": row['Index']}))
-                            for h_row in hedge_pos:
-                                conf = INDICES_CONFIG[h_row['Index']]
-                                h_ltp = 0
-                                try:
-                                    hq = client.quotes(instrument_tokens=[{"instrument_token": str(h_row['Token']), "exchange_segment": conf["Exchange"]}], quote_type="all")
-                                    h_item = hq[0] if isinstance(hq, list) else hq.get('data', [{}])[0]
-                                    h_ltp = float(h_item.get('ltp', h_item.get('lastPrice', 0)))
-                                except: pass
-                                
-                                client.place_order(exchange_segment=conf["Exchange"], product="NRML", price="0", order_type="MKT", quantity=str(int(h_row['Qty'])), validity="DAY", trading_symbol=h_row['TradeSymbol'], transaction_type="S", amo="NO")
-                                # Update Hedge leg to CLOSED in DB
-                                trades_col.update_one({"_id": h_row["_id"]}, {"$set": {"Status": "CLOSED", "ExitPrice": h_ltp}})
-                                
-                        elif status in ['REJECTED', 'CANCELLED']:
-                            # Clear SL details in DB
-                            trades_col.update_one({"_id": row["_id"]}, {"$set": {"SLOrderID": "", "SLPrice": 0}})
-
-        except Exception as e: print(f"SL Monitor Error: {e}")
-        time.sleep(600)
-
-threading.Thread(target=sl_monitor_thread, daemon=True).start()
-
-def auto_updater():
-    while True:
-        try:
-            for cid in list(USER_SESSIONS.keys()): fetch_data_for_user(cid)
-        except: pass
-        time.sleep(180) 
-threading.Thread(target=auto_updater, daemon=True).start()
 # =========================================
 # --- 3. MENUS ---
 # =========================================
