@@ -162,7 +162,7 @@ def auto_generate_chain(cid):
         
         prefix = f"{idx_name}{expiry_date_str}"
         relevant = df[df["7"].str.startswith(prefix, na=False)]
-        strikes = [atm + (i * conf["StrikeGap"]) for i in range(-20, 21)]
+        strikes = [atm + (i * conf["StrikeGap"]) for i in range(-50, 51)]
         new_list = []
         
         for index, r in relevant.iterrows():
@@ -501,7 +501,7 @@ def main_handler(message):
             if pool.empty:
                 bot.send_message(cid, "❌ Hedge not found.")
                 return
-            pool['diff'] = abs(pool['LTP'] - (main['LTP'] * 0.20))
+            pool['diff'] = abs(pool['LTP'] - (main['LTP'] * 0.10))
             hedge = pool.sort_values(by=['diff', 'LTP']).iloc[0]
             PENDING_TRADE[cid]["Main"] = main.to_dict()
             PENDING_TRADE[cid]["Hedge"] = hedge.to_dict()
