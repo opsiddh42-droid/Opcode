@@ -22,8 +22,8 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 # AI Setup
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
-    # Using the requested model
-    ai_model = genai.GenerativeModel('gemini-3.1-flash-lite-preview') 
+    # Changed to gemini-2.5-flash for better logical reasoning
+    ai_model = genai.GenerativeModel('gemini-2.5-flash') 
 else:
     print("⚠️ GEMINI_API_KEY not found! AI Analysis will not work.")
 
@@ -35,6 +35,7 @@ db = mongo_client["tradingbot"]
 users_col = db["users"]
 trades_col = db["trades"]
 fo_master_col = db["fo_master"]
+analysis_col = db["analysis_history"] # New collection for OI Shifting
 
 INDICES_CONFIG = {
     "NIFTY": {"Exchange": "nse_fo", "LotSize": 65, "StrikeGap": 50},
@@ -121,45 +122,90 @@ def get_ai_analysis(cid):
         
     try:
         idx_name = USER_SETTINGS[cid]["Index"]
-        atm = USER_SETTINGS[cid].get("ATM", "Unknown")
+        conf = INDICES_CONFIG[idx_name]
+        atm = float(USER_SETTINGS[cid].get("ATM", 0))
         df = pd.DataFrame(ACTIVE_TOKENS[cid])
         
         if 'OI' not in df.columns: df['OI'] = 0
         df['OI'] = df['OI'].fillna(0).astype(int)
         
-        ce_df = df[df['Type'] == 'CE']
-        pe_df = df[df['Type'] == 'PE']
+        # 1. MACRO PICTURE (Overall Day Data)
+        ce_df_full = df[df['Type'] == 'CE']
+        pe_df_full = df[df['Type'] == 'PE']
+        overall_ce_oi = int(ce_df_full['OI'].sum())
+        overall_pe_oi = int(pe_df_full['OI'].sum())
+        overall_pcr = round(overall_pe_oi / overall_ce_oi, 2) if overall_ce_oi > 0 else 0
         
-        total_ce_oi = ce_df['OI'].sum()
-        total_pe_oi = pe_df['OI'].sum()
+        # 2. MICRO PICTURE (Intraday Active Zone: ATM ± 6 Strikes)
+        zone_range = conf["StrikeGap"] * 6 
+        lower_bound = atm - zone_range
+        upper_bound = atm + zone_range
         
-        # Calculate PCR safely
-        pcr = round(total_pe_oi / total_ce_oi, 2) if total_ce_oi > 0 else 0
+        ce_df_zone = df[(df['Type'] == 'CE') & (df['Strike'] >= lower_bound) & (df['Strike'] <= upper_bound)]
+        pe_df_zone = df[(df['Type'] == 'PE') & (df['Strike'] >= lower_bound) & (df['Strike'] <= upper_bound)]
         
-        # Find Max OI Strikes
-        max_ce_strike = ce_df.loc[ce_df['OI'].idxmax()]['Strike'] if not ce_df.empty else "N/A"
-        max_ce_oi_val = ce_df['OI'].max()
-        max_pe_strike = pe_df.loc[pe_df['OI'].idxmax()]['Strike'] if not pe_df.empty else "N/A"
-        max_pe_oi_val = pe_df['OI'].max()
+        curr_ce_oi = int(ce_df_zone['OI'].sum())
+        curr_pe_oi = int(pe_df_zone['OI'].sum())
+        zone_pcr = round(curr_pe_oi / curr_ce_oi, 2) if curr_ce_oi > 0 else 0
         
+        zone_max_ce_strike = ce_df_zone.loc[ce_df_zone['OI'].idxmax()]['Strike'] if not ce_df_zone.empty else "N/A"
+        zone_max_pe_strike = pe_df_zone.loc[pe_df_zone['OI'].idxmax()]['Strike'] if not pe_df_zone.empty else "N/A"
+
+        # 3. HISTORY TRACKING (For catching sudden smart-money shifts)
+        query = {"ChatID": str(cid), "Index": idx_name}
+        last_record = analysis_col.find_one(query)
+        
+        prev_ce_oi = last_record.get("Zone_CE_OI", curr_ce_oi) if last_record else curr_ce_oi
+        prev_pe_oi = last_record.get("Zone_PE_OI", curr_pe_oi) if last_record else curr_pe_oi
+        prev_time = last_record.get("Time", "Day Start") if last_record else "Day Start"
+        
+        current_time = datetime.now().strftime("%H:%M:%S")
+        analysis_col.update_one(
+            query,
+            {"$set": {"Zone_CE_OI": curr_ce_oi, "Zone_PE_OI": curr_pe_oi, "Time": current_time}},
+            upsert=True
+        )
+
+        target_premium = 20 if idx_name == "NIFTY" else 40
+        
+        ce_change = curr_ce_oi - prev_ce_oi
+        pe_change = curr_pe_oi - prev_pe_oi
+
+        # PROMPT 6.0 - THE RUTHLESS QUANT FRAMEWORK
         prompt = f"""
-        Aap ek expert F&O data analyst hain. Niche aaj ke {idx_name} options ka live data diya gaya hai:
-        - Current ATM Strike: {atm}
-        - Total Call OI: {total_ce_oi}
-        - Total Put OI: {total_pe_oi}
-        - PCR (Put-Call Ratio): {pcr}
-        - Highest Call OI (Resistance): Strike {max_ce_strike} par hai (OI: {max_ce_oi_val})
-        - Highest Put OI (Support): Strike {max_pe_strike} par hai (OI: {max_pe_oi_val})
+        Aap ek ruthless, highly decisive Institutional Quant Analyst hain jo ek professional Option Seller ko clear trade commands deta hai.
         
-        Is data ke aadhar par sirf 3-4 lines mein ek crisp, actionable market bias bataiye (Bullish, Bearish ya Sideways). 
-        Bataiye ki kis level ke tootne par option sellers ko trap mil sakta hai aur aaj kis side (CE ya PE) trade karna less risky rahega.
-        Language Hindi aur English ka mix (Hinglish) rakhiye jaisa Indian traders use karte hain. Ekdum to-the-point baat kijiye.
+        **Live Data for {idx_name}:**
+        - Current ATM: {atm}
+        - MACRO Trend (Full Day PCR): {overall_pcr}
+        - MICRO Trend (Active Zone {lower_bound}-{upper_bound} PCR): {zone_pcr}
+        
+        **Recent Smart Money Shift (From {prev_time} to {current_time}):**
+        - Call OI Change in Zone: {ce_change}
+        - Put OI Change in Zone: {pe_change}
+        - Highest Call Resistance in Zone: {zone_max_ce_strike}
+        - Highest Put Support in Zone: {zone_max_pe_strike}
+        
+        **Trader Profile:** Option Seller, target premium to short is ~₹{target_premium}.
+        
+        **CRITICAL INSTRUCTIONS (DO NOT VIOLATE):**
+        1. NO DIPLOMATIC ANSWERS. Do not say "Market dono side ja sakta hai", "Wait for confirmation", or "Agar range break ho toh".
+        2. Pick ONE primary bias based on the data.
+        3. Explain WHO IS GETTING TRAPPED. (Example: If ATM is near {zone_max_ce_strike} and Call OI is dropping, Call sellers are trapped in short covering).
+        4. Based on the shift ({ce_change} vs {pe_change}) and PCR mismatch, command exactly what to short.
+        
+        Format your response EXACTLY like this in strict Hinglish:
+        
+        🧠 **Quant Reasoning & Trap Zone:** [1-2 lines. Example: "Overall PCR Bearish hai, aur recent shift mein Call writing aggressively badhi hai. Put writers support hold nahi kar paa rahe hain."]
+        🎯 **Definitive Bias:** [Strong Bearish / Strong Bullish / Pure Sideways]
+        ⚡ **Trade Execution Command:** [Clear command. Example: "CE side short karo. Strike {zone_max_ce_strike} ya uske upar jiska premium ~₹{target_premium} ho. PE bilkul short mat karna."]
         """
         
         response = ai_model.generate_content(prompt)
         return response.text
     except Exception as e:
         return f"❌ AI Analysis failed: {e}"
+
         # =========================================
 # --- 2. DATA ENGINE & MONITOR ---
 # =========================================
