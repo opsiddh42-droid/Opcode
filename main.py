@@ -9,13 +9,23 @@ import io
 from neo_api_client import NeoAPI
 from datetime import datetime, timedelta
 from pymongo import MongoClient
+import google.generativeai as genai
 
 # =========================================
-# --- CONFIGURATION & MONGODB ---
+# --- CONFIGURATION & MONGODB & AI ---
 # =========================================
-# Secrets fetched from Render Environment Variables
+# Secrets fetched from Environment Variables
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+# AI Setup
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    # Using the requested model
+    ai_model = genai.GenerativeModel('gemini-3.1-flash-lite-preview') 
+else:
+    print("⚠️ GEMINI_API_KEY not found! AI Analysis will not work.")
 
 # MongoDB Setup
 mongo_client = MongoClient(MONGO_URI)
@@ -26,7 +36,6 @@ users_col = db["users"]
 trades_col = db["trades"]
 fo_master_col = db["fo_master"]
 
-# Url hata diya gaya hai kyunki ab data direct MongoDB se aayega
 INDICES_CONFIG = {
     "NIFTY": {"Exchange": "nse_fo", "LotSize": 65, "StrikeGap": 50},
     "SENSEX": {"Exchange": "bse_fo", "LotSize": 20, "StrikeGap": 100}
@@ -39,11 +48,12 @@ USER_SETTINGS = {}
 USER_STATE = {}
 PENDING_TRADE = {}
 ACTIVE_TOKENS = {} 
+TEMP_REG_DATA = {}
 
 # =========================================
-# --- 1. SETUP & MONGODB MANAGEMENT ---
+# --- 1. SETUP, DB MANAGEMENT & AI LOGIC ---
 # =========================================
-print("🚀 Starting Advanced Algo Bot with Auto-SL Monitoring (MongoDB Edition)...")
+print("🚀 Starting Advanced Algo Bot with AI Analysis & Auto-SL...")
 USER_SESSIONS.clear()
 bot = telebot.TeleBot(BOT_TOKEN)
 
@@ -54,7 +64,6 @@ def load_users():
             cid = int(row.get('ChatID', 0))
             if cid == 0: continue
             
-            # Smart Key Fix applied here
             USER_DETAILS[cid] = {
                 "Name": row.get('Name', ''), 
                 "Key": row.get('Key', row.get('ConsumerKey', '')), 
@@ -103,7 +112,55 @@ def format_crore_lakh(number):
     if val >= 10000000: return f"{number / 10000000:.2f} Cr"
     elif val >= 100000: return f"{number / 100000:.2f} L"
     else: return f"{number:,.0f}"
-# =========================================
+
+def get_ai_analysis(cid):
+    if not GEMINI_API_KEY:
+        return "❌ Gemini API Key missing in environment."
+    if cid not in ACTIVE_TOKENS or not ACTIVE_TOKENS[cid]:
+        return "❌ Data not loaded. Please refresh data first."
+        
+    try:
+        idx_name = USER_SETTINGS[cid]["Index"]
+        atm = USER_SETTINGS[cid].get("ATM", "Unknown")
+        df = pd.DataFrame(ACTIVE_TOKENS[cid])
+        
+        if 'OI' not in df.columns: df['OI'] = 0
+        df['OI'] = df['OI'].fillna(0).astype(int)
+        
+        ce_df = df[df['Type'] == 'CE']
+        pe_df = df[df['Type'] == 'PE']
+        
+        total_ce_oi = ce_df['OI'].sum()
+        total_pe_oi = pe_df['OI'].sum()
+        
+        # Calculate PCR safely
+        pcr = round(total_pe_oi / total_ce_oi, 2) if total_ce_oi > 0 else 0
+        
+        # Find Max OI Strikes
+        max_ce_strike = ce_df.loc[ce_df['OI'].idxmax()]['Strike'] if not ce_df.empty else "N/A"
+        max_ce_oi_val = ce_df['OI'].max()
+        max_pe_strike = pe_df.loc[pe_df['OI'].idxmax()]['Strike'] if not pe_df.empty else "N/A"
+        max_pe_oi_val = pe_df['OI'].max()
+        
+        prompt = f"""
+        Aap ek expert F&O data analyst hain. Niche aaj ke {idx_name} options ka live data diya gaya hai:
+        - Current ATM Strike: {atm}
+        - Total Call OI: {total_ce_oi}
+        - Total Put OI: {total_pe_oi}
+        - PCR (Put-Call Ratio): {pcr}
+        - Highest Call OI (Resistance): Strike {max_ce_strike} par hai (OI: {max_ce_oi_val})
+        - Highest Put OI (Support): Strike {max_pe_strike} par hai (OI: {max_pe_oi_val})
+        
+        Is data ke aadhar par sirf 3-4 lines mein ek crisp, actionable market bias bataiye (Bullish, Bearish ya Sideways). 
+        Bataiye ki kis level ke tootne par option sellers ko trap mil sakta hai aur aaj kis side (CE ya PE) trade karna less risky rahega.
+        Language Hindi aur English ka mix (Hinglish) rakhiye jaisa Indian traders use karte hain. Ekdum to-the-point baat kijiye.
+        """
+        
+        response = ai_model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        return f"❌ AI Analysis failed: {e}"
+        # =========================================
 # --- 2. DATA ENGINE & MONITOR ---
 # =========================================
 def auto_generate_chain(cid):
@@ -123,14 +180,13 @@ def auto_generate_chain(cid):
         df = pd.DataFrame(list(cursor))
         
         if df.empty or "5" not in df.columns.astype(str):
-            return False, "❌ Master Data Empty in MongoDB. Data theek se upload nahi hua."
+            return False, "❌ Master Data Empty in MongoDB."
 
         df.columns = df.columns.astype(str)
         row = df[df["5"] == search_sym]
         
         if row.empty: return False, f"❌ Future Not Found: {search_sym}"
         
-        # Safe float conversion
         fut_token = str(int(float(row.iloc[0]["0"])))
         
         q = client.quotes(instrument_tokens=[{"instrument_token": fut_token, "exchange_segment": conf["Exchange"]}], quote_type="all")
@@ -146,7 +202,6 @@ def auto_generate_chain(cid):
         expiry_date_str = None
         all_ref_keys = set(df["7"].astype(str).values) 
         
-        # SMART EXPIRY FINDER: '.00' aur bina '.00' dono check karega
         for i in range(0, 45):
             test_date = now + timedelta(days=i)
             d_str = f"{test_date.strftime('%d')}{test_date.strftime('%b').upper()}{test_date.strftime('%y')}"
@@ -176,7 +231,7 @@ def auto_generate_chain(cid):
                      new_list.append({"TradeSymbol": trd_sym, "RefKey": ref_key, "Token": token, "Type": "PE", "Strike": stk, "LTP": 0.0, "OI": 0})
                      
         if not new_list:
-            return False, "❌ Strikes list empty reh gayi. Master Data check karein."
+            return False, "❌ Strikes list empty."
             
         ACTIVE_TOKENS[cid] = new_list
         return True, f"ATM: {atm} | Exp: {expiry_date_str}"
@@ -195,7 +250,7 @@ def fetch_data_for_user(cid):
     conf = INDICES_CONFIG[idx_name]
     try:
         all_tokens = ACTIVE_TOKENS[cid]
-        if not all_tokens: return False, "❌ Tokens list is empty"
+        if not all_tokens: return False, "❌ Tokens list empty"
             
         live_map = {}
         batch_size = 50
@@ -221,7 +276,6 @@ def fetch_data_for_user(cid):
 def sl_monitor_thread():
     while True:
         try:
-            # Fetch ONLY open trades with an active SL from MongoDB directly
             open_sl_trades = list(trades_col.find({"Status": "OPEN", "SLOrderID": {"$nin": ["", "nan", None]}}))
             
             for row in open_sl_trades:
@@ -234,8 +288,9 @@ def sl_monitor_thread():
                         status = order_hist[0].get('status', '').upper()
                         if status in ['COMPLETE', 'FILLED']:
                             trades_col.update_one({"_id": row["_id"]}, {"$set": {"Status": "CLOSED", "ExitPrice": row['SLPrice']}})
-                            bot.send_message(cid, f"🎯 **SL HIT:** {row['TradeSymbol']}\nClosing Hedge Automatically...")
+                            bot.send_message(cid, f"🎯 **SL HIT:** {row['TradeSymbol']}\nClosing Hedge Automatically (if any)...")
                             
+                            # Close Hedge Position logic
                             hedge_pos = list(trades_col.find({"ChatID": str(cid), "Status": "OPEN", "Side": "BUY", "Index": row['Index']}))
                             for h_row in hedge_pos:
                                 conf = INDICES_CONFIG[h_row['Index']]
@@ -252,8 +307,9 @@ def sl_monitor_thread():
                         elif status in ['REJECTED', 'CANCELLED']:
                             trades_col.update_one({"_id": row["_id"]}, {"$set": {"SLOrderID": "", "SLPrice": 0}})
 
-        except Exception as e: print(f"SL Monitor Error: {e}")
-        time.sleep(600)
+        except Exception as e: 
+            pass # Silent fail to prevent crash loop
+        time.sleep(5) # Changed from 600 to 5 seconds for critical SL monitoring
 
 threading.Thread(target=sl_monitor_thread, daemon=True).start()
 
@@ -264,12 +320,15 @@ def auto_updater():
         except: pass
         time.sleep(180) 
 threading.Thread(target=auto_updater, daemon=True).start()
+
 # =========================================
 # --- 3. MENUS ---
 # =========================================
 def get_main_menu(cid):
     idx = USER_SETTINGS[cid]["Index"]
     mk = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
+    # AI button added here!
+    mk.add(types.KeyboardButton("🤖 AI Market Analysis"))
     mk.add(types.KeyboardButton("🔄 Refresh Data"))
     mk.add(types.KeyboardButton(f"🚀 New Trade ({idx})"), types.KeyboardButton("💰 P&L"))
     mk.add(types.KeyboardButton("📊 OI Data"), types.KeyboardButton("🔄 Change ATM (Auto)"))
@@ -315,7 +374,6 @@ def cmd_start(message):
 # =========================================
 # --- 5. REGISTRATION & LOGIN ---
 # =========================================
-TEMP_REG_DATA = {}
 @bot.message_handler(func=lambda m: (USER_STATE.get(m.chat.id) or "").startswith("REG_"))
 def reg_flow(m):
     cid, text = m.chat.id, m.text.strip()
@@ -338,7 +396,7 @@ def reg_flow(m):
         if save_new_user(cid, TEMP_REG_DATA[cid]):
             bot.send_message(cid, "✅ Registered! Click Login.", reply_markup=get_login_btn())
         else:
-            bot.send_message(cid, "❌ Database Error! Render logs check karein.")
+            bot.send_message(cid, "❌ Database Error! Check Render logs.")
         USER_STATE[cid] = None
 
 @bot.message_handler(func=lambda m: m.text == "🔐 Login Now")
@@ -380,7 +438,14 @@ def main_handler(message):
 
     if cid not in USER_SESSIONS: return
 
-    if "Index:" in text:
+    # --- AI ANALYSIS BUTTON ---
+    if text == "🤖 AI Market Analysis":
+        bot.send_message(cid, "⏳ *AI Market ko analyze kar raha hai, please wait...*", parse_mode="Markdown")
+        fetch_data_for_user(cid) # Update data before sending to AI
+        analysis_result = get_ai_analysis(cid)
+        bot.send_message(cid, f"🤖 **Gemini AI Analysis:**\n\n{analysis_result}")
+
+    elif "Index:" in text:
         mk = types.InlineKeyboardMarkup()
         mk.add(types.InlineKeyboardButton("🔵 NIFTY", callback_data="SET_NIFTY"),
                types.InlineKeyboardButton("🔴 SENSEX", callback_data="SET_SENSEX"))
@@ -462,6 +527,7 @@ def main_handler(message):
         mk = types.InlineKeyboardMarkup()
         mk.add(types.InlineKeyboardButton("📈 Call (CE)", callback_data="TRADE_CE"),
                types.InlineKeyboardButton("📉 Put (PE)", callback_data="TRADE_PE"))
+        # Pehle CE/PE select hoga, uske baad callbacks mein Hedge/No-Hedge poochenge.
         bot.send_message(cid, f"🚀 **{idx} Trade**\nSelect Strategy:", reply_markup=mk)
 
     elif text == "🚨 EXIT ALL":
@@ -486,28 +552,43 @@ def main_handler(message):
             conf = INDICES_CONFIG[idx]
             qty = int(lots * conf["LotSize"])
             PENDING_TRADE[cid]["Qty"] = qty
+            
             fetch_data_for_user(cid)
             df = pd.DataFrame(ACTIVE_TOKENS[cid])
             target = PENDING_TRADE[cid]["Target"]
             opt_type = PENDING_TRADE[cid]["Type"]
+            hedge_mode = PENDING_TRADE[cid].get("HedgeMode", "HEDGE") # Default HEDGE
+            
             df = df[(df['Type'] == opt_type) & (df['LTP'] > 0)]
             if df.empty:
-                bot.send_message(cid, "❌ No Data.")
+                bot.send_message(cid, "❌ No Option Data available.")
                 return
+                
             main = df[df['LTP'] <= target].sort_values('LTP', ascending=False)
             main = main.iloc[0] if not main.empty else df.sort_values('LTP', ascending=True).iloc[0]
-            if opt_type == 'CE': pool = df[df['Strike'] > main['Strike']].copy()
-            else: pool = df[df['Strike'] < main['Strike']].copy()
-            if pool.empty:
-                bot.send_message(cid, "❌ Hedge not found.")
-                return
-            pool['diff'] = abs(pool['LTP'] - (main['LTP'] * 0.20))
-            hedge = pool.sort_values(by=['diff', 'LTP']).iloc[0]
             PENDING_TRADE[cid]["Main"] = main.to_dict()
-            PENDING_TRADE[cid]["Hedge"] = hedge.to_dict()
-            msg = (f"⚡ **CONFIRM {idx} TRADE**\nLots: {lots} (Qty: {qty})\n"
-                   f"🔴 SELL: {main['TradeSymbol']} (@{main['LTP']})\n"
-                   f"🟢 BUY: {hedge['TradeSymbol']} (@{hedge['LTP']})\nExecute?")
+            
+            if hedge_mode == "HEDGE":
+                if opt_type == 'CE': pool = df[df['Strike'] > main['Strike']].copy()
+                else: pool = df[df['Strike'] < main['Strike']].copy()
+                
+                if pool.empty:
+                    bot.send_message(cid, "❌ Hedge not found. Out of Strikes.")
+                    return
+                pool['diff'] = abs(pool['LTP'] - (main['LTP'] * 0.20))
+                hedge = pool.sort_values(by=['diff', 'LTP']).iloc[0]
+                PENDING_TRADE[cid]["Hedge"] = hedge.to_dict()
+                
+                msg = (f"⚡ **CONFIRM {idx} HEDGED TRADE**\nLots: {lots} (Qty: {qty})\n"
+                       f"🔴 SELL: {main['TradeSymbol']} (@{main['LTP']})\n"
+                       f"🟢 BUY: {hedge['TradeSymbol']} (@{hedge['LTP']})\nExecute?")
+            else:
+                # Direct Sell Mode
+                PENDING_TRADE[cid]["Hedge"] = None
+                msg = (f"⚡ **CONFIRM {idx} DIRECT SELL (NO HEDGE)**\nLots: {lots} (Qty: {qty})\n"
+                       f"🔴 SELL: {main['TradeSymbol']} (@{main['LTP']})\n"
+                       f"⚠️ Alert: You are doing a Naked Sell.\nExecute?")
+
             mk = types.InlineKeyboardMarkup()
             mk.add(types.InlineKeyboardButton("🔥 FIRE", callback_data="EXECUTE_TRADE"),
                    types.InlineKeyboardButton("❌ CANCEL", callback_data="CANCEL_TRADE"))
@@ -549,20 +630,30 @@ def on_callback(call):
     if call.data == "SET_NIFTY":
         USER_SETTINGS[cid]["Index"] = "NIFTY"
         ACTIVE_TOKENS[cid] = [] 
-        bot.send_message(cid, "✅ Index: NIFTY", reply_markup=get_main_menu(cid))
+        bot.edit_message_text("✅ Index: NIFTY", cid, call.message.message_id)
+        bot.send_message(cid, "Menu Updated.", reply_markup=get_main_menu(cid))
         auto_generate_chain(cid)
     
     elif call.data == "SET_SENSEX":
         USER_SETTINGS[cid]["Index"] = "SENSEX"
         ACTIVE_TOKENS[cid] = []
-        bot.send_message(cid, "✅ Index: SENSEX", reply_markup=get_main_menu(cid))
+        bot.edit_message_text("✅ Index: SENSEX", cid, call.message.message_id)
+        bot.send_message(cid, "Menu Updated.", reply_markup=get_main_menu(cid))
         auto_generate_chain(cid)
 
-    # --- TRADE FLOW ---
+    # --- TRADE FLOW (HEDGE / NO-HEDGE) ---
     elif call.data in ["TRADE_CE", "TRADE_PE"]:
         PENDING_TRADE[cid] = {"Type": "CE" if "CE" in call.data else "PE"}
+        mk = types.InlineKeyboardMarkup()
+        mk.add(types.InlineKeyboardButton("🛡️ With Hedge", callback_data="HEDGE_YES"),
+               types.InlineKeyboardButton("⚠️ Without Hedge", callback_data="HEDGE_NO"))
+        bot.edit_message_text("Select Trade Mode:", cid, call.message.message_id, reply_markup=mk)
+
+    elif call.data in ["HEDGE_YES", "HEDGE_NO"]:
+        PENDING_TRADE[cid]["HedgeMode"] = "HEDGE" if call.data == "HEDGE_YES" else "DIRECT"
         USER_STATE[cid] = "WAIT_PREMIUM"
-        bot.send_message(cid, "💰 Enter Sell Premium Target:")
+        mode_text = "Hedged" if call.data == "HEDGE_YES" else "Naked Sell"
+        bot.edit_message_text(f"💰 Enter Sell Premium Target for {mode_text} Trade:", cid, call.message.message_id)
 
     elif call.data == "EXECUTE_TRADE":
         try:
@@ -573,18 +664,21 @@ def on_callback(call):
             client = USER_SESSIONS[cid]
             qty = int(t_data["Qty"])
             
-            resp_hedge = client.place_order(exchange_segment=conf["Exchange"], product="NRML", price="0", order_type="MKT", quantity=str(qty), validity="DAY", trading_symbol=t_data["Hedge"]["TradeSymbol"], transaction_type="B", amo="NO")
-            if not isinstance(resp_hedge, dict) or 'nOrdNo' not in resp_hedge:
-                bot.send_message(cid, f"❌ Hedge Buy Failed: {resp_hedge}")
-                return
+            # 1. Place Hedge Buy Order (If HEDGE mode selected)
+            if t_data.get("HedgeMode") == "HEDGE" and t_data.get("Hedge"):
+                resp_hedge = client.place_order(exchange_segment=conf["Exchange"], product="NRML", price="0", order_type="MKT", quantity=str(qty), validity="DAY", trading_symbol=t_data["Hedge"]["TradeSymbol"], transaction_type="B", amo="NO")
+                
+                if not isinstance(resp_hedge, dict) or 'nOrdNo' not in resp_hedge:
+                    bot.send_message(cid, f"❌ Hedge Buy Failed: {resp_hedge}")
+                    return
+                time.sleep(0.2)
+                log_trade(cid, idx, t_data["Hedge"]["TradeSymbol"], t_data["Hedge"]["Token"], t_data["Type"], "BUY", qty, t_data["Hedge"]["LTP"], str(resp_hedge['nOrdNo']))
 
-            time.sleep(0.2)
+            # 2. Place Main Sell Order
             resp_main = client.place_order(exchange_segment=conf["Exchange"], product="NRML", price="0", order_type="MKT", quantity=str(qty), validity="DAY", trading_symbol=t_data["Main"]["TradeSymbol"], transaction_type="S", amo="NO")
             
-            log_trade(cid, idx, t_data["Hedge"]["TradeSymbol"], t_data["Hedge"]["Token"], t_data["Type"], "BUY", qty, t_data["Hedge"]["LTP"], str(resp_hedge['nOrdNo']))
-            
             if not isinstance(resp_main, dict) or 'nOrdNo' not in resp_main:
-                bot.send_message(cid, f"⚠️ Hedge placed, but Main SELL failed: {resp_main}")
+                bot.send_message(cid, f"⚠️ Main SELL failed: {resp_main}")
             else:
                 log_trade(cid, idx, t_data["Main"]["TradeSymbol"], t_data["Main"]["Token"], t_data["Type"], "SELL", qty, t_data["Main"]["LTP"], str(resp_main['nOrdNo']))
                 mk = types.InlineKeyboardMarkup(row_width=2)
@@ -592,11 +686,11 @@ def on_callback(call):
                        types.InlineKeyboardButton("25%", callback_data=f"SLSET_{resp_main['nOrdNo']}_25"),
                        types.InlineKeyboardButton("50%", callback_data=f"SLSET_{resp_main['nOrdNo']}_50"),
                        types.InlineKeyboardButton("100%", callback_data=f"SLSET_{resp_main['nOrdNo']}_100"))
-                bot.send_message(cid, f"✅ Trade Executed!\nID: {resp_main['nOrdNo']}\n\n**Set Stop Loss?**", reply_markup=mk)
+                bot.send_message(cid, f"✅ Trade Executed!\nMain Order ID: {resp_main['nOrdNo']}\n\n**Set Stop Loss?**", reply_markup=mk)
         except Exception as e: bot.send_message(cid, f"❌ Execution Err: {e}")
 
     elif call.data == "CANCEL_TRADE":
-        bot.edit_message_text("🚫 Cancelled.", cid, call.message.message_id)
+        bot.edit_message_text("🚫 Trade Cancelled.", cid, call.message.message_id)
 
     elif call.data == "EXIT_CANCEL":
         bot.delete_message(cid, call.message.message_id)
@@ -728,20 +822,16 @@ def on_callback(call):
 # =========================================
 # --- 8. RENDER CRASH PROTECTION & DUMMY SERVER ---
 # =========================================
-import os
 from http.server import BaseHTTPRequestHandler, HTTPServer
-import threading
 
-# Dummy server class to keep Render Web Service happy
 class DummyHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header('Content-type', 'text/plain')
         self.end_headers()
-        self.wfile.write(b"Bot is active and polling!")
+        self.wfile.write(b"Bot is active, AI logic ready, and polling!")
 
 def keep_alive():
-    # Render assigns a PORT environment variable dynamically
     port = int(os.environ.get("PORT", 8080))
     server = HTTPServer(('0.0.0.0', port), DummyHandler)
     print(f"🌐 Dummy web server running on port {port}")
@@ -749,13 +839,11 @@ def keep_alive():
 
 def start_bot():
     print("🤖 Bot is polling...")
-    bot.infinity_polling()
+    bot.infinity_polling(timeout=10, long_polling_timeout=5)
 
 if __name__ == "__main__":
-    # Start the dummy server in a background thread
     threading.Thread(target=keep_alive, daemon=True).start()
     
-    # Start the Telegram bot in the main thread
     while True:
         try:
             start_bot()
