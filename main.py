@@ -4,8 +4,6 @@ import pandas as pd
 import time
 import os
 import threading
-import requests
-import io
 from neo_api_client import NeoAPI
 from datetime import datetime, timedelta
 from pymongo import MongoClient
@@ -41,14 +39,14 @@ INDICES_CONFIG = {
     "NIFTY": {
         "Exchange": "nse_fo", 
         "SpotExchange": "nse_cm",  
-        "SpotToken": "Nifty 50",   
+        "SpotToken": "nifty50",    # Exact string token as confirmed
         "LotSize": 25,             
         "StrikeGap": 50
     },
     "SENSEX": {
         "Exchange": "bse_fo", 
         "SpotExchange": "bse_cm", 
-        "SpotToken": "Sensex",     
+        "SpotToken": "sensex",     
         "LotSize": 10,             
         "StrikeGap": 100
     }
@@ -222,7 +220,7 @@ def get_ai_analysis(cid):
 # =========================================
 # --- 2. DATA ENGINE & MONITOR ---
 # =========================================
-# UPDATED: Fast Option Chain with Live Spot Price (isIndex=True)
+# UPDATED: Fast Option Chain with Live Spot Price (No isIndex to avoid crash)
 def auto_generate_chain(cid):
     idx_name = USER_SETTINGS[cid]["Index"]
     conf = INDICES_CONFIG[idx_name]
@@ -232,14 +230,14 @@ def auto_generate_chain(cid):
     now = datetime.now()
     
     try:
-        # 1. Fetch Spot Price with isIndex=True
+        # 1. Fetch Spot Price safely
         spot_token = conf["SpotToken"]
         spot_exchange = conf["SpotExchange"]
         
         inst_tokens = [{"instrument_token": spot_token, "exchange_segment": spot_exchange}]
         
-        # isIndex=True is critical for NIFTY/SENSEX Spot fetching in Kotak Neo
-        q = client.quotes(instrument_tokens=inst_tokens, quote_type="all", isIndex=True)
+        # isIndex removed as per Kotak REST API requirements
+        q = client.quotes(instrument_tokens=inst_tokens, quote_type="all")
         
         ltp = 0
         if q:
@@ -252,7 +250,7 @@ def auto_generate_chain(cid):
         atm = round(ltp / conf["StrikeGap"]) * conf["StrikeGap"]
         USER_SETTINGS[cid]["ATM"] = f"{atm}"
         
-        # 3. Fast Expiry Matching from DB
+        # 3. Fast Expiry Matching from DB (Only for Reference Keys)
         cursor = fo_master_col.find({"IndexName": idx_name})
         df = pd.DataFrame(list(cursor))
         
@@ -276,7 +274,7 @@ def auto_generate_chain(cid):
                 
         if not expiry_date_str: return False, f"❌ Expiry Not Found for ATM {atm}"
         
-        # 4. Filter only ATM ± 10 Strikes for Super-Fast Data Fetching
+        # 4. Filter only ATM ± 10 Strikes for Super-Fast Fetching
         prefix = f"{idx_name}{expiry_date_str}"
         relevant = df[df["7"].str.startswith(prefix, na=False)]
         
@@ -393,7 +391,7 @@ def get_main_menu(cid):
     mk.add(types.KeyboardButton("🤖 AI Market Analysis"))
     mk.add(types.KeyboardButton("🔄 Refresh Data"))
     mk.add(types.KeyboardButton(f"🚀 New Trade ({idx})"), types.KeyboardButton("💰 P&L"))
-    mk.add(types.KeyboardButton("📊 OI Data"), types.KeyboardButton("📋 Open Orders")) # Added Open Orders
+    mk.add(types.KeyboardButton("📊 OI Data"), types.KeyboardButton("📋 Open Orders"))
     mk.add(types.KeyboardButton("🛑 Stop Loss (SL)"), types.KeyboardButton(f"Index: {idx} 🔀"))
     mk.add(types.KeyboardButton("🚪 Logout"), types.KeyboardButton("🚨 EXIT ALL"))
     return mk
@@ -529,7 +527,12 @@ def main_handler(message):
             client = USER_SESSIONS[cid]
             positions_resp = client.positions()
             
-            pos_list = positions_resp if isinstance(positions_resp, list) else positions_resp.get('data', [])
+            # Extract data array properly
+            pos_list = []
+            if isinstance(positions_resp, dict) and 'data' in positions_resp:
+                pos_list = positions_resp['data']
+            elif isinstance(positions_resp, list):
+                pos_list = positions_resp
             
             if not pos_list:
                 bot.send_message(cid, "✅ No Positions found in Broker account.")
@@ -540,12 +543,19 @@ def main_handler(message):
             has_open_pos = False
             
             for p in pos_list:
-                net_qty = int(p.get('flQty', p.get('netQty', 0)))
+                # Bulletproof Net Quantity Calculation
+                try:
+                    net_qty = int(p.get('netQty', p.get('flQty', 0)))
+                except:
+                    # Fallback if direct key is missing or unusual
+                    b_qty = int(p.get('flBuyQty', 0)) + int(p.get('cfBuyQty', 0))
+                    s_qty = int(p.get('flSellQty', 0)) + int(p.get('cfSellQty', 0))
+                    net_qty = b_qty - s_qty
                 
                 if net_qty != 0:
                     has_open_pos = True
                     sym = p.get('trdSym', p.get('trading_symbol', 'Unknown'))
-                    mtm = float(p.get('mtm', p.get('unRealizedPnL', 0.0)))
+                    mtm = float(p.get('mtm', p.get('unRealizedPnL', p.get('pnl', 0.0))))
                     ltp = float(p.get('ltp', p.get('lastPrice', 0.0)))
                     
                     total_mtm += mtm
@@ -911,7 +921,7 @@ class DummyHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-type', 'text/plain')
         self.end_headers()
-        self.wfile.write(b"Bot is active, AI logic ready, Spot price enabled, and polling!")
+        self.wfile.write(b"Bot is active, Spot price enabled, and polling!")
 
 def keep_alive():
     port = int(os.environ.get("PORT", 8080))
