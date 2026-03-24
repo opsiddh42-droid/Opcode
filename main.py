@@ -4,6 +4,8 @@ import pandas as pd
 import time
 import os
 import threading
+import requests
+import io
 from neo_api_client import NeoAPI
 from datetime import datetime, timedelta
 from pymongo import MongoClient
@@ -34,22 +36,10 @@ trades_col = db["trades"]
 fo_master_col = db["fo_master"]
 analysis_col = db["analysis_history"]
 
-# UPDATED: Spot Tokens for Nifty & Sensex
+# UPDATED: Added SpotTokens
 INDICES_CONFIG = {
-    "NIFTY": {
-        "Exchange": "nse_fo", 
-        "SpotExchange": "nse_cm",  
-        "SpotToken": "nifty50",    # Exact string token as confirmed
-        "LotSize": 25,             
-        "StrikeGap": 50
-    },
-    "SENSEX": {
-        "Exchange": "bse_fo", 
-        "SpotExchange": "bse_cm", 
-        "SpotToken": "sensex",     
-        "LotSize": 10,             
-        "StrikeGap": 100
-    }
+    "NIFTY": {"Exchange": "nse_fo", "SpotExchange": "nse_cm", "SpotToken": "nifty50", "LotSize": 65, "StrikeGap": 50},
+    "SENSEX": {"Exchange": "bse_fo", "SpotExchange": "bse_cm", "SpotToken": "26000", "LotSize": 20, "StrikeGap": 100}
 }
 
 # --- GLOBALS ---
@@ -64,7 +54,7 @@ TEMP_REG_DATA = {}
 # =========================================
 # --- 1. SETUP, DB MANAGEMENT & AI LOGIC ---
 # =========================================
-print("🚀 Starting Advanced Algo Bot with Spot ATM, Direct P&L & AI Analysis...")
+print("🚀 Starting Advanced Algo Bot with AI Analysis, Spot ATM & Auto-SL...")
 USER_SESSIONS.clear()
 bot = telebot.TeleBot(BOT_TOKEN)
 
@@ -124,7 +114,7 @@ def format_crore_lakh(number):
     elif val >= 100000: return f"{number / 100000:.2f} L"
     else: return f"{number:,.0f}"
 
-# UPDATED: AI Analysis focusing on ATM + 4 OTM Strikes
+# UPDATED: AI Analysis with ATM+4 OTM Focus & Safe Side Logic
 def get_ai_analysis(cid):
     if not GEMINI_API_KEY:
         return "❌ Gemini API Key missing in environment."
@@ -137,19 +127,18 @@ def get_ai_analysis(cid):
         atm = float(USER_SETTINGS[cid].get("ATM", 0))
         df = pd.DataFrame(ACTIVE_TOKENS[cid])
         
-        # Ensure data types are correct
-        df['OI'] = pd.to_numeric(df['OI'], errors='coerce').fillna(0).astype(int)
-        df['Strike'] = pd.to_numeric(df['Strike'], errors='coerce').astype(float)
+        if 'OI' not in df.columns: df['OI'] = 0
+        df['OI'] = df['OI'].fillna(0).astype(int)
         
-        # 1. MACRO PICTURE (Overall PCR)
+        # MACRO PCR
         overall_ce_oi = int(df[df['Type'] == 'CE']['OI'].sum())
         overall_pe_oi = int(df[df['Type'] == 'PE']['OI'].sum())
         overall_pcr = round(overall_pe_oi / overall_ce_oi, 2) if overall_ce_oi > 0 else 0
         
-        # 2. MICRO PICTURE (Strictly ATM + 4 OTM Strikes)
+        # MICRO: ATM + 4 OTM Logic
         gap = conf["StrikeGap"]
-        ce_otm_strikes = [atm + (i * gap) for i in range(0, 5)] 
-        pe_otm_strikes = [atm - (i * gap) for i in range(0, 5)]
+        ce_otm_strikes = [atm + (i * gap) for i in range(5)]
+        pe_otm_strikes = [atm - (i * gap) for i in range(5)]
         
         ce_otm_df = df[(df['Type'] == 'CE') & (df['Strike'].isin(ce_otm_strikes))]
         pe_otm_df = df[(df['Type'] == 'PE') & (df['Strike'].isin(pe_otm_strikes))]
@@ -158,21 +147,25 @@ def get_ai_analysis(cid):
         otm_pe_oi = int(pe_otm_df['OI'].sum())
         otm_pcr = round(otm_pe_oi / otm_ce_oi, 2) if otm_ce_oi > 0 else 0
         
+        # Max OI for Support & Resistance in active zone
         otm_max_ce_strike = ce_otm_df.loc[ce_otm_df['OI'].idxmax()]['Strike'] if not ce_otm_df.empty else "N/A"
         otm_max_pe_strike = pe_otm_df.loc[pe_otm_df['OI'].idxmax()]['Strike'] if not pe_otm_df.empty else "N/A"
 
-        # 3. HISTORY TRACKING (For catching sudden OI shifting)
+        # Determine safe side: Highest OI is safe for option seller
+        safe_side = "CE (Resistance strong hai, Call sell karna safe hai)" if otm_ce_oi > otm_pe_oi else "PE (Support strong hai, Put sell karna safe hai)"
+
+        # HISTORY TRACKING
         query = {"ChatID": str(cid), "Index": idx_name}
         last_record = analysis_col.find_one(query)
         
-        prev_ce_oi = last_record.get("OTM_CE_OI", otm_ce_oi) if last_record else otm_ce_oi
-        prev_pe_oi = last_record.get("OTM_PE_OI", otm_pe_oi) if last_record else otm_pe_oi
+        prev_ce_oi = last_record.get("Zone_CE_OI", otm_ce_oi) if last_record else otm_ce_oi
+        prev_pe_oi = last_record.get("Zone_PE_OI", otm_pe_oi) if last_record else otm_pe_oi
         prev_time = last_record.get("Time", "Day Start") if last_record else "Day Start"
         
         current_time = datetime.now().strftime("%H:%M:%S")
         analysis_col.update_one(
             query,
-            {"$set": {"OTM_CE_OI": otm_ce_oi, "OTM_PE_OI": otm_pe_oi, "Time": current_time}},
+            {"$set": {"Zone_CE_OI": otm_ce_oi, "Zone_PE_OI": otm_pe_oi, "Time": current_time}},
             upsert=True
         )
 
@@ -185,16 +178,17 @@ def get_ai_analysis(cid):
         
         **Live Data for {idx_name}:**
         - Current ATM: {atm}
-        - MACRO Trend (Full Chain PCR): {overall_pcr}
-        - MICRO Trend (ATM to 4 OTM PCR): {otm_pcr}
+        - MACRO Trend (Full Day PCR): {overall_pcr}
+        - MICRO Trend (ATM+4 OTM PCR): {otm_pcr}
         
-        **Immediate Smart Money Zone (ATM to 4 OTM):**
-        - OTM Call OI (Resistance Strength): {otm_ce_oi}
-        - OTM Put OI (Support Strength): {otm_pe_oi}
-        - Highest Call Resistance in OTM Zone: {otm_max_ce_strike}
-        - Highest Put Support in OTM Zone: {otm_max_pe_strike}
+        **Active Zone (ATM + 4 OTM):**
+        - Total OTM Call OI: {otm_ce_oi}
+        - Total OTM Put OI: {otm_pe_oi}
+        - Strongest Resistance (Max CE OI): {otm_max_ce_strike}
+        - Strongest Support (Max PE OI): {otm_max_pe_strike}
+        - Safest Side to Sell Options based on higher OI: {safe_side}
         
-        **Recent OI Shift in OTM Zone (From {prev_time} to {current_time}):**
+        **Recent Smart Money Shift (From {prev_time} to {current_time}):**
         - Call OI Change: {ce_change}
         - Put OI Change: {pe_change}
         
@@ -202,15 +196,15 @@ def get_ai_analysis(cid):
         
         **CRITICAL INSTRUCTIONS (DO NOT VIOLATE):**
         1. NO DIPLOMATIC ANSWERS. Pick ONE primary bias.
-        2. Focus heavily on the **MICRO Trend (ATM to 4 OTM PCR)**. Agar MACRO aur MICRO diverge kar rahe hain, toh MICRO (ATM+4 OTM) ko importance do kyunki wahi par live action ho raha hai.
-        3. Explain WHO IS GETTING TRAPPED based on the OI shifting ({ce_change} vs {pe_change}).
-        4. Give a clear execution command.
+        2. Strictly use the rule: "Jis side jyada OI hota hai, wo side sell karna safe hota hai". Focus on the Safe Side metric provided above.
+        3. Explain WHO IS GETTING TRAPPED.
+        4. Based on the shift ({ce_change} vs {pe_change}) and PCR mismatch, command exactly what to short.
         
         Format your response EXACTLY like this in strict Hinglish:
         
-        🧠 **Quant Reasoning & Trap Zone:** [Short and sharp analysis focusing on ATM+4 OTM PCR and shifting]
+        🧠 **Quant Reasoning & Trap Zone:** [Explain PCR, OTM shifts, and safe side logic based on high OI resistance/support]
         🎯 **Definitive Bias:** [Strong Bearish / Strong Bullish / Pure Sideways]
-        ⚡ **Trade Execution Command:** [Clear command for Option Seller. Mention which side to short and the safe strike near {otm_max_ce_strike} or {otm_max_pe_strike}]
+        ⚡ **Trade Execution Command:** [Clear command. Example: "CE side short karo. Strike {otm_max_ce_strike} ke aas-paas jiska premium ~₹{target_premium} ho."]
         """
         
         response = ai_model.generate_content(prompt)
@@ -220,7 +214,6 @@ def get_ai_analysis(cid):
 # =========================================
 # --- 2. DATA ENGINE & MONITOR ---
 # =========================================
-# UPDATED: Fast Option Chain with Live Spot Price (No isIndex to avoid crash)
 def auto_generate_chain(cid):
     idx_name = USER_SETTINGS[cid]["Index"]
     conf = INDICES_CONFIG[idx_name]
@@ -230,13 +223,13 @@ def auto_generate_chain(cid):
     now = datetime.now()
     
     try:
-        # 1. Fetch Spot Price safely
+        # 1. Fetch Spot Price safely (nifty50 or 26000)
         spot_token = conf["SpotToken"]
         spot_exchange = conf["SpotExchange"]
         
         inst_tokens = [{"instrument_token": spot_token, "exchange_segment": spot_exchange}]
         
-        # isIndex removed as per Kotak REST API requirements
+        # isIndex removed, standard quote fetching
         q = client.quotes(instrument_tokens=inst_tokens, quote_type="all")
         
         ltp = 0
@@ -274,7 +267,7 @@ def auto_generate_chain(cid):
                 
         if not expiry_date_str: return False, f"❌ Expiry Not Found for ATM {atm}"
         
-        # 4. Filter only ATM ± 10 Strikes for Super-Fast Fetching
+        # 4. Filter only ATM ± 10 Strikes for Super-Fast Fetching (Same logic as requested)
         prefix = f"{idx_name}{expiry_date_str}"
         relevant = df[df["7"].str.startswith(prefix, na=False)]
         
@@ -391,9 +384,10 @@ def get_main_menu(cid):
     mk.add(types.KeyboardButton("🤖 AI Market Analysis"))
     mk.add(types.KeyboardButton("🔄 Refresh Data"))
     mk.add(types.KeyboardButton(f"🚀 New Trade ({idx})"), types.KeyboardButton("💰 P&L"))
-    mk.add(types.KeyboardButton("📊 OI Data"), types.KeyboardButton("📋 Open Orders"))
-    mk.add(types.KeyboardButton("🛑 Stop Loss (SL)"), types.KeyboardButton(f"Index: {idx} 🔀"))
+    mk.add(types.KeyboardButton("📊 OI Data"), types.KeyboardButton("📋 API Orders")) # API Open Orders
+    mk.add(types.KeyboardButton("🛑 Stop Loss (SL)"), types.KeyboardButton("🗑️ DB Orders")) # DB Order management
     mk.add(types.KeyboardButton("🚪 Logout"), types.KeyboardButton("🚨 EXIT ALL"))
+    mk.add(types.KeyboardButton(f"Index: {idx} 🔀"))
     return mk
 
 def get_login_btn():
@@ -527,7 +521,6 @@ def main_handler(message):
             client = USER_SESSIONS[cid]
             positions_resp = client.positions()
             
-            # Extract data array properly
             pos_list = []
             if isinstance(positions_resp, dict) and 'data' in positions_resp:
                 pos_list = positions_resp['data']
@@ -543,11 +536,9 @@ def main_handler(message):
             has_open_pos = False
             
             for p in pos_list:
-                # Bulletproof Net Quantity Calculation
                 try:
                     net_qty = int(p.get('netQty', p.get('flQty', 0)))
                 except:
-                    # Fallback if direct key is missing or unusual
                     b_qty = int(p.get('flBuyQty', 0)) + int(p.get('cfBuyQty', 0))
                     s_qty = int(p.get('flSellQty', 0)) + int(p.get('cfSellQty', 0))
                     net_qty = b_qty - s_qty
@@ -571,8 +562,8 @@ def main_handler(message):
         except Exception as e: 
             bot.send_message(cid, f"❌ P&L Error: {e}")
 
-    # --- DIRECT OPEN ORDERS FROM BROKER ---
-    elif text == "📋 Open Orders":
+    # --- DIRECT API OPEN ORDERS FROM BROKER ---
+    elif text == "📋 API Orders":
         try:
             client = USER_SESSIONS[cid]
             orders_resp = client.order_report()
@@ -585,10 +576,10 @@ def main_handler(message):
             ]
             
             if not open_orders:
-                bot.send_message(cid, "✅ No Open or Pending Orders.")
+                bot.send_message(cid, "✅ No Open or Pending Orders in API.")
                 return
             
-            msg = "📋 **Live Open Orders (From Broker)**\n\n"
+            msg = "📋 **Live Open Orders (From Broker API)**\n\n"
             for o in open_orders:
                 sym = o.get('trdSym', o.get('trading_symbol', 'Unknown'))
                 status = str(o.get('ordSt', o.get('status', ''))).upper()
@@ -604,6 +595,23 @@ def main_handler(message):
             bot.send_message(cid, msg)
         except Exception as e: 
             bot.send_message(cid, f"❌ Order Fetch Error: {e}")
+
+    # --- CHECK AND CLEAR DB OPEN ORDERS ---
+    elif text == "🗑️ DB Orders":
+        try:
+            open_db_orders = list(trades_col.find({"ChatID": str(cid), "Status": "OPEN"}))
+            if not open_db_orders:
+                bot.send_message(cid, "✅ Database is clean. No stuck Open Orders.")
+                return
+            
+            mk = types.InlineKeyboardMarkup(row_width=1)
+            for row in open_db_orders:
+                mk.add(types.InlineKeyboardButton(f"❌ Clear {row['TradeSymbol']}", callback_data=f"DBCLEAR_{row['OrderID']}"))
+            mk.add(types.InlineKeyboardButton("🗑️ Clear ALL DB Orders", callback_data="DBCLEAR_ALL"))
+            mk.add(types.InlineKeyboardButton("⬅️ Close", callback_data="EXIT_CANCEL"))
+            
+            bot.send_message(cid, "🛠 **Manage Database (DB) Orders:**\nClear orders if they are stuck in bot memory.", reply_markup=mk)
+        except Exception as e: bot.send_message(cid, f"❌ DB Fetch Error: {e}")
 
     elif text == "📊 OI Data":
         success, msg = fetch_data_for_user(cid)
@@ -772,19 +780,50 @@ def on_callback(call):
                 time.sleep(0.2)
                 log_trade(cid, idx, t_data["Hedge"]["TradeSymbol"], t_data["Hedge"]["Token"], t_data["Type"], "BUY", qty, t_data["Hedge"]["LTP"], str(resp_hedge['nOrdNo']))
 
+            # Place Main Sell Order
             resp_main = client.place_order(exchange_segment=conf["Exchange"], product="NRML", price="0", order_type="MKT", quantity=str(qty), validity="DAY", trading_symbol=t_data["Main"]["TradeSymbol"], transaction_type="S", amo="NO")
             
             if not isinstance(resp_main, dict) or 'nOrdNo' not in resp_main:
                 bot.send_message(cid, f"⚠️ Main SELL failed: {resp_main}")
             else:
-                log_trade(cid, idx, t_data["Main"]["TradeSymbol"], t_data["Main"]["Token"], t_data["Type"], "SELL", qty, t_data["Main"]["LTP"], str(resp_main['nOrdNo']))
+                main_oid = str(resp_main['nOrdNo'])
+                entry_price = float(t_data["Main"]["LTP"])
+                log_trade(cid, idx, t_data["Main"]["TradeSymbol"], t_data["Main"]["Token"], t_data["Type"], "SELL", qty, entry_price, main_oid)
+                
+                # ==========================================
+                # AUTO 200% STOPLOSS WITH 10 POINT BUFFER
+                # ==========================================
+                sl_trigger = round(entry_price * 2.0, 1) # 200% Trigger
+                sl_limit = sl_trigger + 10.0 # Trigger + 10 point buffer
+                
+                time.sleep(0.5) # Slight delay for broker server to register trade
+                
+                resp_sl = client.place_order(exchange_segment=conf["Exchange"], product="NRML", price=str(sl_limit), order_type="SL", quantity=str(qty), validity="DAY", trading_symbol=t_data["Main"]["TradeSymbol"], transaction_type="B", trigger_price=str(sl_trigger), amo="NO")
+                
+                if isinstance(resp_sl, dict) and 'nOrdNo' in resp_sl:
+                    trades_col.update_one({"OrderID": main_oid}, {"$set": {"SLOrderID": str(resp_sl['nOrdNo']), "SLPrice": sl_trigger}})
+                    sl_msg = f"\n✅ Auto 200% SL Placed! Trigger: {sl_trigger} | Limit: {sl_limit}"
+                else:
+                    sl_msg = f"\n⚠️ Auto SL Failed: {resp_sl}"
+
                 mk = types.InlineKeyboardMarkup(row_width=2)
-                mk.add(types.InlineKeyboardButton("105% (Auto)", callback_data=f"SLSET_{resp_main['nOrdNo']}_105"),
-                       types.InlineKeyboardButton("25%", callback_data=f"SLSET_{resp_main['nOrdNo']}_25"),
-                       types.InlineKeyboardButton("50%", callback_data=f"SLSET_{resp_main['nOrdNo']}_50"),
-                       types.InlineKeyboardButton("100%", callback_data=f"SLSET_{resp_main['nOrdNo']}_100"))
-                bot.send_message(cid, f"✅ Trade Executed!\nMain Order ID: {resp_main['nOrdNo']}\n\n**Set Stop Loss?**", reply_markup=mk)
+                mk.add(types.InlineKeyboardButton("Modify SL", callback_data=f"SLMENU_{main_oid}"))
+                bot.send_message(cid, f"✅ Trade Executed!\nMain Order ID: {main_oid}{sl_msg}", reply_markup=mk)
         except Exception as e: bot.send_message(cid, f"❌ Execution Err: {e}")
+
+    # DB CLEAR CALLBACKS
+    elif call.data == "DBCLEAR_ALL":
+        try:
+            trades_col.update_many({"ChatID": str(cid), "Status": "OPEN"}, {"$set": {"Status": "CLOSED", "ExitPrice": 0}})
+            bot.edit_message_text("🗑️ All DB orders have been marked as CLOSED.", cid, call.message.message_id)
+        except Exception as e: bot.send_message(cid, f"❌ Clear DB Error: {e}")
+        
+    elif call.data.startswith("DBCLEAR_"):
+        oid = call.data.split("_")[1]
+        try:
+            trades_col.update_one({"OrderID": str(oid)}, {"$set": {"Status": "CLOSED", "ExitPrice": 0}})
+            bot.edit_message_text(f"🗑️ DB Order {oid} has been marked as CLOSED.", cid, call.message.message_id)
+        except Exception as e: bot.send_message(cid, f"❌ Clear DB Error: {e}")
 
     elif call.data == "CANCEL_TRADE":
         bot.edit_message_text("🚫 Trade Cancelled.", cid, call.message.message_id)
@@ -803,7 +842,7 @@ def on_callback(call):
                 sl_status = f" (SL: {row.get('SLPrice', 0)})" if row.get('SLPrice', 0) > 0 else " (No SL)"
                 mk.add(types.InlineKeyboardButton(f"{row['TradeSymbol']}{sl_status}", callback_data=f"SLMENU_{row['OrderID']}"))
             mk.add(types.InlineKeyboardButton("⬅️ Back", callback_data="EXIT_CANCEL"))
-            bot.edit_message_text("🎯 **Select position to set SL:**", cid, call.message.message_id, reply_markup=mk)
+            bot.edit_message_text("🎯 **Select position to modify/cancel SL:**", cid, call.message.message_id, reply_markup=mk)
         except Exception as e: bot.send_message(cid, f"❌ SL List Error: {e}")
 
     elif call.data.startswith("SLMENU_"):
@@ -837,7 +876,7 @@ def on_callback(call):
             
             if isinstance(resp, dict) and 'nOrdNo' in resp:
                 trades_col.update_one({"_id": row["_id"]}, {"$set": {"SLOrderID": str(resp['nOrdNo']), "SLPrice": sl_trigger}})
-                bot.edit_message_text(f"✅ SL Set at {sl_trigger}\nOrder ID: {resp['nOrdNo']}", cid, call.message.message_id)
+                bot.edit_message_text(f"✅ Modified SL Set at {sl_trigger}\nOrder ID: {resp['nOrdNo']}", cid, call.message.message_id)
             else: bot.send_message(cid, f"❌ SL Failed: {resp}")
         except Exception as e: bot.send_message(cid, f"❌ SL Set Error: {e}")
 
@@ -872,7 +911,7 @@ def on_callback(call):
         try:
             open_rows = list(trades_col.find({"ChatID": str(cid), "Status": "OPEN"}))
             if not open_rows:
-                bot.send_message(cid, "✅ No Open Positions.")
+                bot.send_message(cid, "✅ No Open DB Positions.")
                 return
             client = USER_SESSIONS[cid]
             
@@ -921,7 +960,7 @@ class DummyHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-type', 'text/plain')
         self.end_headers()
-        self.wfile.write(b"Bot is active, Spot price enabled, and polling!")
+        self.wfile.write(b"Bot is active, Auto SL added, and DB Orders logic is running!")
 
 def keep_alive():
     port = int(os.environ.get("PORT", 8080))
