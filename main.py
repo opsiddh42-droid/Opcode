@@ -6,6 +6,7 @@ import os
 import threading
 import requests
 import io
+import re
 from neo_api_client import NeoAPI
 from datetime import datetime, timedelta
 from pymongo import MongoClient
@@ -36,10 +37,16 @@ trades_col = db["trades"]
 fo_master_col = db["fo_master"]
 analysis_col = db["analysis_history"]
 
-# UPDATED: Added SpotTokens
+# UPDATED: Merged your Spot Tokens with original config
 INDICES_CONFIG = {
-    "NIFTY": {"Exchange": "nse_fo", "SpotExchange": "nse_cm", "SpotToken": "nifty50", "LotSize": 65, "StrikeGap": 50},
-    "SENSEX": {"Exchange": "bse_fo", "SpotExchange": "bse_cm", "SpotToken": "26000", "LotSize": 20, "StrikeGap": 100}
+    "NIFTY": {
+        "Exchange": "nse_fo", "SpotExchange": "nse_cm", "SpotToken": "Nifty 50", 
+        "LotSize": 25, "StrikeGap": 50
+    },
+    "SENSEX": {
+        "Exchange": "bse_fo", "SpotExchange": "bse_cm", "SpotToken": "BSESN", 
+        "LotSize": 10, "StrikeGap": 100
+    }
 }
 
 # --- GLOBALS ---
@@ -54,7 +61,7 @@ TEMP_REG_DATA = {}
 # =========================================
 # --- 1. SETUP, DB MANAGEMENT & AI LOGIC ---
 # =========================================
-print("🚀 Starting Advanced Algo Bot with AI Analysis, Spot ATM & Auto-SL...")
+print("🚀 Starting Advanced Algo Bot (Spot ATM + Future Chain + 200% Auto-SL)...")
 USER_SESSIONS.clear()
 bot = telebot.TeleBot(BOT_TOKEN)
 
@@ -114,7 +121,7 @@ def format_crore_lakh(number):
     elif val >= 100000: return f"{number / 100000:.2f} L"
     else: return f"{number:,.0f}"
 
-# UPDATED: AI Analysis with ATM+4 OTM Focus & Safe Side Logic
+# AI Analysis with ATM+4 OTM Focus & Safe Side Logic
 def get_ai_analysis(cid):
     if not GEMINI_API_KEY:
         return "❌ Gemini API Key missing in environment."
@@ -223,24 +230,53 @@ def auto_generate_chain(cid):
     now = datetime.now()
     
     try:
-        # 1. Fetch Spot Price safely (nifty50 or 26000)
+        # 1. Fetch Spot Price safely
         spot_token = conf["SpotToken"]
-        spot_exchange = conf["SpotExchange"]
+        spot_exch = conf["SpotExchange"]
         
-        inst_tokens = [{"instrument_token": spot_token, "exchange_segment": spot_exchange}]
+        q = client.quotes(instrument_tokens=[{"instrument_token": spot_token, "exchange_segment": spot_exch}], quote_type="all")
         
-        # isIndex removed, standard quote fetching
-        q = client.quotes(instrument_tokens=inst_tokens, quote_type="all")
-        
-        ltp = 0
+        base_ltp, s_open, s_high, s_low, s_close = 0, 0, 0, 0, 0
         if q:
             item = q[0] if isinstance(q, list) else q.get('data', [{}])[0]
-            ltp = float(item.get('ltp', item.get('lastPrice', 0)))
+            base_ltp = float(item.get('ltp', item.get('lastPrice', 0)))
             
-        if ltp == 0: return False, "❌ Spot Price is 0 (Market Closed / API error)"
-        
-        # 2. Calculate ATM based on Live Spot Price
-        atm = round(ltp / conf["StrikeGap"]) * conf["StrikeGap"]
+            ohlc_data = item.get('ohlc', {})
+            s_open = float(ohlc_data.get('open', item.get('openPrice', 0)))
+            s_high = float(ohlc_data.get('high', item.get('highPrice', 0)))
+            s_low = float(ohlc_data.get('low', item.get('lowPrice', 0)))
+            s_close = float(ohlc_data.get('close', item.get('previousClose', 0)))
+
+        # 🚨 Fallback: Agar Spot 0 मिले तो Future का डेटा लें (MongoDB से)
+        if base_ltp == 0:
+            yy = now.strftime("%y")
+            mon = now.strftime("%b").upper()
+            search_sym = f"{idx_name}{yy}{mon}FUT"
+            
+            fut_cursor = fo_master_col.find({"IndexName": idx_name, "5": search_sym})
+            fut_list = list(fut_cursor)
+            
+            if fut_list:
+                f_tok = str(int(float(fut_list[0]["0"])))
+                q_fut = client.quotes(instrument_tokens=[{"instrument_token": f_tok, "exchange_segment": conf["Exchange"]}], quote_type="all")
+                if q_fut:
+                    f_item = q_fut[0] if isinstance(q_fut, list) else q_fut.get('data', [{}])[0]
+                    base_ltp = float(f_item.get('ltp', f_item.get('lastPrice', 0)))
+                    
+                    ohlc_data_fut = f_item.get('ohlc', {})
+                    s_open = float(ohlc_data_fut.get('open', f_item.get('openPrice', 0)))
+                    s_high = float(ohlc_data_fut.get('high', f_item.get('highPrice', 0)))
+                    s_low = float(ohlc_data_fut.get('low', f_item.get('lowPrice', 0)))
+                    s_close = float(ohlc_data_fut.get('close', f_item.get('previousClose', 0)))
+
+        if base_ltp == 0: return False, "❌ Spot & Future Price 0 (Market Closed / API error)"
+
+        # Save Spot Data for AI Analysis
+        if "SpotData" not in USER_SETTINGS[cid]: USER_SETTINGS[cid]["SpotData"] = {}
+        USER_SETTINGS[cid]['SpotData'] = {'LTP': base_ltp, 'Open': s_open, 'High': s_high, 'Low': s_low, 'Close': s_close}
+            
+        # 2. Calculate Exact ATM
+        atm = int(round(base_ltp / conf["StrikeGap"]) * conf["StrikeGap"])
         USER_SETTINGS[cid]["ATM"] = f"{atm}"
         
         # 3. Fast Expiry Matching from DB (Only for Reference Keys)
@@ -267,7 +303,7 @@ def auto_generate_chain(cid):
                 
         if not expiry_date_str: return False, f"❌ Expiry Not Found for ATM {atm}"
         
-        # 4. Filter only ATM ± 10 Strikes for Super-Fast Fetching (Same logic as requested)
+        # 4. Filter only ATM ± 10 Strikes for Super-Fast Fetching
         prefix = f"{idx_name}{expiry_date_str}"
         relevant = df[df["7"].str.startswith(prefix, na=False)]
         
@@ -288,7 +324,7 @@ def auto_generate_chain(cid):
             return False, "❌ Strikes list empty."
             
         ACTIVE_TOKENS[cid] = new_list
-        return True, f"🎯 Spot: {ltp} | ATM: {atm} | Exp: {expiry_date_str}"
+        return True, f"🎯 Price: {base_ltp} | ATM: {atm} | Exp: {expiry_date_str}"
         
     except Exception as e: 
         return False, f"❌ Chain Gen Error: {str(e)}"
@@ -482,7 +518,7 @@ def main_handler(message):
             USER_SESSIONS[cid] = cl
             USER_STATE[cid] = None
             idx = USER_SETTINGS[cid]["Index"]
-            bot.send_message(cid, f"✅ Logged In! Index: {idx}", reply_markup=get_main_menu(cid))
+            bot.send_message(cid, f"✅ Logged In! Index: {idx}\n⏳ Calculating Spot ATM...", reply_markup=get_main_menu(cid))
             auto_generate_chain(cid)
         except Exception as e:
             bot.send_message(cid, f"❌ Login Failed: {e}", reply_markup=get_login_btn())
@@ -623,10 +659,10 @@ def main_handler(message):
 
     elif text == "🛑 Stop Loss (SL)":
         mk = types.InlineKeyboardMarkup(row_width=1)
-        mk.add(types.InlineKeyboardButton("🎯 Place/Modify SL", callback_data="SL_LIST_POSITIONS"),
+        mk.add(types.InlineKeyboardButton("🎯 Modify Specific SL", callback_data="SL_LIST_POSITIONS"),
                types.InlineKeyboardButton("🗑️ Cancel All SL Orders", callback_data="SL_CANCEL_ALL"),
                types.InlineKeyboardButton("❌ Close", callback_data="EXIT_CANCEL"))
-        bot.send_message(cid, "⚙️ **Manage Stop Loss:**\n(Applies to SELL trades only)", reply_markup=mk)
+        bot.send_message(cid, "⚙️ **Manage Stop Loss:**\n(Note: 200% SL is Auto-placed on Execution)", reply_markup=mk)
 
     elif "New Trade" in text:
         idx = USER_SETTINGS[cid]["Index"]
@@ -771,6 +807,7 @@ def on_callback(call):
             client = USER_SESSIONS[cid]
             qty = int(t_data["Qty"])
             
+            # Place Hedge Buy Order
             if t_data.get("HedgeMode") == "HEDGE" and t_data.get("Hedge"):
                 resp_hedge = client.place_order(exchange_segment=conf["Exchange"], product="NRML", price="0", order_type="MKT", quantity=str(qty), validity="DAY", trading_symbol=t_data["Hedge"]["TradeSymbol"], transaction_type="B", amo="NO")
                 
@@ -796,22 +833,20 @@ def on_callback(call):
                 sl_trigger = round(entry_price * 2.0, 1) # 200% Trigger
                 sl_limit = sl_trigger + 10.0 # Trigger + 10 point buffer
                 
-                time.sleep(0.5) # Slight delay for broker server to register trade
+                time.sleep(0.5) # Slight delay for broker server
                 
                 resp_sl = client.place_order(exchange_segment=conf["Exchange"], product="NRML", price=str(sl_limit), order_type="SL", quantity=str(qty), validity="DAY", trading_symbol=t_data["Main"]["TradeSymbol"], transaction_type="B", trigger_price=str(sl_trigger), amo="NO")
                 
                 if isinstance(resp_sl, dict) and 'nOrdNo' in resp_sl:
                     trades_col.update_one({"OrderID": main_oid}, {"$set": {"SLOrderID": str(resp_sl['nOrdNo']), "SLPrice": sl_trigger}})
-                    sl_msg = f"\n✅ Auto 200% SL Placed! Trigger: {sl_trigger} | Limit: {sl_limit}"
+                    sl_msg = f"\n✅ **Auto 200% SL Placed!**\nTrigger: {sl_trigger} | Limit: {sl_limit}"
                 else:
                     sl_msg = f"\n⚠️ Auto SL Failed: {resp_sl}"
 
-                mk = types.InlineKeyboardMarkup(row_width=2)
-                mk.add(types.InlineKeyboardButton("Modify SL", callback_data=f"SLMENU_{main_oid}"))
-                bot.send_message(cid, f"✅ Trade Executed!\nMain Order ID: {main_oid}{sl_msg}", reply_markup=mk)
+                bot.send_message(cid, f"✅ Trade Executed!\nMain Order ID: {main_oid}{sl_msg}")
         except Exception as e: bot.send_message(cid, f"❌ Execution Err: {e}")
 
-    # DB CLEAR CALLBACKS
+    # --- DB CLEAR CALLBACKS ---
     elif call.data == "DBCLEAR_ALL":
         try:
             trades_col.update_many({"ChatID": str(cid), "Status": "OPEN"}, {"$set": {"Status": "CLOSED", "ExitPrice": 0}})
@@ -842,7 +877,7 @@ def on_callback(call):
                 sl_status = f" (SL: {row.get('SLPrice', 0)})" if row.get('SLPrice', 0) > 0 else " (No SL)"
                 mk.add(types.InlineKeyboardButton(f"{row['TradeSymbol']}{sl_status}", callback_data=f"SLMENU_{row['OrderID']}"))
             mk.add(types.InlineKeyboardButton("⬅️ Back", callback_data="EXIT_CANCEL"))
-            bot.edit_message_text("🎯 **Select position to modify/cancel SL:**", cid, call.message.message_id, reply_markup=mk)
+            bot.edit_message_text("🎯 **Select position to modify SL:**", cid, call.message.message_id, reply_markup=mk)
         except Exception as e: bot.send_message(cid, f"❌ SL List Error: {e}")
 
     elif call.data.startswith("SLMENU_"):
