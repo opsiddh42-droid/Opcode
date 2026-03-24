@@ -41,11 +41,11 @@ analysis_col = db["analysis_history"]
 INDICES_CONFIG = {
     "NIFTY": {
         "Exchange": "nse_fo", "SpotExchange": "nse_cm", "SpotToken": "Nifty 50", 
-        "LotSize": 25, "StrikeGap": 50
+        "LotSize": 65, "StrikeGap": 50
     },
     "SENSEX": {
         "Exchange": "bse_fo", "SpotExchange": "bse_cm", "SpotToken": "BSESN", 
-        "LotSize": 10, "StrikeGap": 100
+        "LotSize": 20, "StrikeGap": 100
     }
 }
 
