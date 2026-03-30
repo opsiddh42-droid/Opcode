@@ -32,8 +32,8 @@ fo_master_col = db["fo_master"]
 analysis_col = db["analysis_history"]
 
 INDICES_CONFIG = {
-    "NIFTY": {"Exchange": "nse_fo", "SpotExchange": "nse_cm", "SpotToken": "256265", "LotSize": 25, "StrikeGap": 50},
-    "SENSEX": {"Exchange": "bse_fo", "SpotExchange": "bse_cm", "SpotToken": "1", "LotSize": 10, "StrikeGap": 100}
+    "NIFTY": {"Exchange": "nse_fo", "SpotExchange": "nse_cm", "SpotToken": "NIFTY50", "LotSize": 65, "StrikeGap": 50},
+    "SENSEX": {"Exchange": "bse_fo", "SpotExchange": "bse_cm", "SpotToken": "1", "LotSize": 20, "StrikeGap": 100}
 }
 
 USER_SESSIONS, USER_DETAILS, USER_SETTINGS = {}, {}, {}
