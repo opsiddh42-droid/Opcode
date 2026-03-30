@@ -73,7 +73,7 @@ def log_trade(cid, idx_name, trade_symbol, token, opt_type, side, qty, price, or
         "Qty": int(qty), "EntryPrice": price, "ExitPrice": 0, "Status": "OPEN", 
         "OrderID": str(order_id), "SLOrderID": "", "SLPrice": 0,
         "InitialOI": initial_oi, "InitialOIChange": initial_oi_chg,
-        "LastAITime": now # Track time for 1-hour analysis
+        "LastAITime": now
     }
     try: trades_col.insert_one(new_row)
     except Exception as e: print(f"DB Insert Error: {e}")
@@ -154,6 +154,7 @@ def auto_generate_chain(cid):
     conf = INDICES_CONFIG[idx_name]
     if cid not in USER_SESSIONS: return False, "❌ No Session Active."
     client = USER_SESSIONS[cid]
+    now = datetime.now()
     
     try:
         q = client.quotes(instrument_tokens=[{"instrument_token": conf["SpotToken"], "exchange_segment": conf["SpotExchange"]}], quote_type="all")
@@ -187,15 +188,29 @@ def auto_generate_chain(cid):
         if df.empty: return False, "❌ Master Data Empty."
         
         df.columns = df.columns.astype(str)
-        relevant_opts = df[df["5"].str.contains("CE|PE", regex=True)]
-        if relevant_opts.empty: return False, "❌ No Options in DB."
         
-        relevant_opts['Exp'] = relevant_opts['5'].str.extract(r'([0-9]{2}[A-Z]{3}[0-9]{2})')
-        expiry_date_str = relevant_opts['Exp'].dropna().iloc[0]
+        # RESTORED YOUR ORIGINAL ROBUST DATE-LOOP LOGIC FOR EXPIRY
+        all_ref_keys = set(df["7"].astype(str).values) 
+        expiry_date_str = None
+        
+        for i in range(0, 45):
+            test_date = now + timedelta(days=i)
+            d_str = f"{test_date.strftime('%d')}{test_date.strftime('%b').upper()}{test_date.strftime('%y')}"
+            
+            check_sym_1 = f"{idx_name}{d_str}{atm}.00CE"
+            check_sym_2 = f"{idx_name}{d_str}{atm}CE" 
+            
+            if check_sym_1 in all_ref_keys or check_sym_2 in all_ref_keys:
+                expiry_date_str = d_str
+                break
+                
+        if not expiry_date_str: return False, f"❌ Expiry Not Found for ATM {atm}"
+        
         prefix = f"{idx_name}{expiry_date_str}"
         relevant = df[df["7"].str.startswith(prefix, na=False)]
         
-        strikes = [atm + (i * conf["StrikeGap"]) for i in range(-40, 41)] 
+        # Reduced from 40 to 20 to prevent API empty list errors at night
+        strikes = [atm + (i * conf["StrikeGap"]) for i in range(-20, 21)] 
         new_list = []
         
         for index, r in relevant.iterrows():
@@ -296,12 +311,11 @@ def hourly_ai_monitor():
                 cid = int(cid_str)
                 if cid not in USER_SESSIONS: continue
                 
-                # Filter trades that haven't been checked in 1 hour
                 needs_analysis = []
                 for t in trades:
                     last_time = t.get('LastAITime')
                     if not last_time: 
-                        last_time = now - timedelta(hours=2) # Force trigger if missing
+                        last_time = now - timedelta(hours=2)
                     if (now - last_time).total_seconds() >= 3600:
                         needs_analysis.append(t)
                 
@@ -342,7 +356,7 @@ def hourly_ai_monitor():
                         
                     prompt += """
                     **Task in Hinglish:**
-                    Analyze how the OI structure has changed since entry for these specific strikes and the overall market. 
+                    Analyze how the OI structure has changed since entry. 
                     Has the market turned against the seller? Are these positions safe? 
                     Give a final verdict: "🟢 SAFE TO HOLD" or "🔴 DANGER - CONSIDER EXIT".
                     """
@@ -353,7 +367,7 @@ def hourly_ai_monitor():
                         
         except Exception as e:
             print(f"Hourly AI Monitor Error: {e}")
-        time.sleep(300) # Checks every 5 mins
+        time.sleep(300) 
 threading.Thread(target=hourly_ai_monitor, daemon=True).start()
 
 # =========================================
@@ -563,7 +577,6 @@ def main_handler(message):
                 ce_oid = str(resp_ce['nOrdNo'])
                 ce_sl_trigger = round(ce['LTP'] * sl_multiplier, 1)
                 ce_sl_limit = ce_sl_trigger + 10.0
-                # Passes initial OI logic
                 log_trade(cid, idx, ce['TradeSymbol'], ce['Token'], "CE", "SELL", qty, ce['LTP'], ce_oid, ce.get('OI',0), ce.get('OI_Change',0))
                 client.place_order(exchange_segment=conf["Exchange"], product="NRML", price=str(ce_sl_limit), order_type="SL", quantity=str(qty), validity="DAY", trading_symbol=ce['TradeSymbol'], transaction_type="B", trigger_price=str(ce_sl_trigger), amo="NO")
                 msg += f"🔴 CE {ce['LTP']} (SL: {ce_sl_trigger})\n"
@@ -572,7 +585,6 @@ def main_handler(message):
                 pe_oid = str(resp_pe['nOrdNo'])
                 pe_sl_trigger = round(pe['LTP'] * sl_multiplier, 1)
                 pe_sl_limit = pe_sl_trigger + 10.0
-                # Passes initial OI logic
                 log_trade(cid, idx, pe['TradeSymbol'], pe['Token'], "PE", "SELL", qty, pe['LTP'], pe_oid, pe.get('OI',0), pe.get('OI_Change',0))
                 client.place_order(exchange_segment=conf["Exchange"], product="NRML", price=str(pe_sl_limit), order_type="SL", quantity=str(qty), validity="DAY", trading_symbol=pe['TradeSymbol'], transaction_type="B", trigger_price=str(pe_sl_trigger), amo="NO")
                 msg += f"🔴 PE {pe['LTP']} (SL: {pe_sl_trigger})"
